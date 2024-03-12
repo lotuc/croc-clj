@@ -1,11 +1,13 @@
 (ns lotuc.croc.impl
   (:require
    [babashka.process :as p]
-   [missionary.core :as m]
    [clojure.java.io :as io]
-   [clojure.string :as string]))
+   [clojure.string :as string]
+   [missionary.core :as m])
+  (:import
+   [java.util.concurrent LinkedBlockingQueue]))
 
-(set! *warn-on-reflection* true)
+;; (set! *warn-on-reflection* true)
 
 (defn croc-cmd
   [options]
@@ -146,19 +148,22 @@
 (defn- stream->line-flow
   "line | :eof | Throwable."
   [s]
-  (m/observe
-   (fn [!]
-     ((m/via m/blk
-        (try (with-open [^java.io.BufferedReader rdr (io/reader s)]
-               (loop []
-                 (when-let [line (.readLine rdr)]
-                   (when-not (string/blank? line)
-                     (! line))
-                   (recur)))
-               (! :eof))
-             (catch Throwable t
-               (! t))))
-      {} {}))))
+  (letfn [(->queue [s]
+            (let [q (LinkedBlockingQueue. 1)]
+              (future (with-open [^java.io.BufferedReader rdr  (io/reader s)]
+                        (loop []
+                          (when-some [line (.readLine rdr)]
+                            (.put q line)
+                            (recur)))
+                        (.put q :eof)))
+              q))
+          (t [^LinkedBlockingQueue q] (.take q))]
+    (m/ap (let [q (->queue s)]
+            (loop []
+              (let [v (m/? (m/via m/blk (t q)))]
+                (if (= v :eof)
+                  (m/amb v)
+                  (m/amb v (recur)))))))))
 
 (defn- make-rf [line->event]
   (fn [rf]
@@ -170,46 +175,46 @@
          (if (or (= val :eof) (instance? Throwable val))
            (rf r [:stopped [source val]])
            (do
+             (rf r v)
              (when-some [e (line->event source val)]
-               (rf r e))
-             (rf r v))))))))
+               (rf r e)))))))))
 
-(defn- merge-stdout-stderr [rf {:keys [out err] :as process}]
-  (m/ap (let [c (atom [])
-              f (->> (m/seed [(->> (stream->line-flow out)
-                                   (m/eduction (map (fn [v] [:stdout v])) rf))
-                              (->> (stream->line-flow err)
-                                   (m/eduction (map (fn [v] [:stderr v])) rf))])
-                     (m/?> ##Inf))
-              v (m/?> f)]
-          (if (= (first v) :stopped)
-            ;; record stream `:stopped` event (stdout & stderr)
-            ;; wait for both stream ending & emit `:stopped` once
-            (let [x (swap! c conj v)]
-              (if (= 2 (count x))
-                (m/amb [:stopped process x])
-                (m/amb)))
-            (m/amb v)))))
+(defn- merge-stdout-stderr
+  [{:keys [out err] :as process} event-rf]
+  (->> (m/ap (let [c (atom [])
+                   f (->> (m/seed [(->> (stream->line-flow out)
+                                        (m/eduction (map (fn [v] [:stdout v])) event-rf))
+                                   (->> (stream->line-flow err)
+                                        (m/eduction (map (fn [v] [:stderr v])) event-rf))])
+                          (m/?> ##Inf))
+                   v (m/?> f)]
+               (if (= (first v) :stopped)
+                 ;; record stream `:stopped` event (stdout & stderr)
+                 ;; wait for both stream ending & emit `:stopped` once
+                 (let [x (swap! c conj v)]
+                   (if (= 2 (count x))
+                     (m/amb [:stopped process x])
+                     (m/amb)))
+                 (m/amb v))))
+       (m/eduction (fn [rf]
+                     (fn
+                       ([] (rf))
+                       ([r] (rf r))
+                       ([r i] (cond-> (rf r i) (= :stopped (first i)) reduced)))))))
 
 (defn croc-event-flow
   [{:keys [send recv relay] :as options} process]
-  (let [rf (cond send (make-rf (fn [s line] (when (= s :stderr) (line->send-event line))))
-                 recv (make-rf (fn [s line] (when (= s :stderr) (line->recv-event line))))
-                 relay (make-rf (fn [_ line] (line->relay-event line)))
-                 :else (throw (ex-info "invalid croc options" {:options options})))]
-    ;; early termination on `:stopped` event
-    (m/eduction
-     (fn [rf]
-       (fn
-         ([] (rf))
-         ([r] (rf r))
-         ([r [evt :as i]] (cond-> (rf r i) (= evt :stopped) reduced))))
-     (merge-stdout-stderr rf process))))
+  (->> (cond send (make-rf (fn [s line] (when (= s :stderr) (line->send-event line))))
+             recv (make-rf (fn [s line] (when (= s :stderr) (line->recv-event line))))
+             relay (make-rf (fn [_ line] (line->relay-event line)))
+             :else (throw (ex-info "invalid croc options" {:options options})))
+       (merge-stdout-stderr process)))
 
 (defn croc
   [{:keys [croc global send recv relay process-options]
     :as options}]
-  (fn [ok-cont _err-cont]
-    (let [process (apply p/process process-options (croc-cmd options))]
-      (ok-cont process)
-      (fn [] (p/destroy-tree process)))))
+  (fn [ok-cont err-cont]
+    (let [process (try (apply p/process process-options (croc-cmd options))
+                       (catch Throwable t (err-cont t)))]
+      (when process (ok-cont process))
+      (fn [] (when process (p/destroy-tree process))))))

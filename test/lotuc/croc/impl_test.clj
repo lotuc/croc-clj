@@ -63,11 +63,22 @@
 (defn- print-event [prefix e]
   (if (vector? e)
     (case (first e)
-      :startprocess (prn prefix :startprocess (pinfo (second e)))
+      :startprocess (println
+                     (with-out-str
+                       (println)
+                       (println prefix (string/join "" (repeat 70 "-")))
+                       (prn prefix :startprocess (pinfo (second e)))
+                       (println prefix (string/join "" (repeat 70 "-")))))
       :stopped      (let [[_ process ms] e]
-                      (prn prefix :stopped (pinfo process))
+                      (println
+                       (with-out-str
+                         (println)
+                         (println prefix (string/join "" (repeat 70 "-")))
+                         (prn prefix :stopped (pinfo process))
+                         (prn prefix :stopped-process (with-out-str (print (:cmd process))))
+                         (println prefix (string/join "" (repeat 70 "-")))))
                       (doseq [m ms]
-                        (prn prefix :stopped :>> m)))
+                        (prn prefix :stopped-std m)))
       :stdout      (apply prn prefix '> (rest e))
       :stderr      (apply prn prefix '! (rest e))
       (apply prn prefix e))
@@ -78,8 +89,13 @@
   ([prefix p] (m/? (m/reduce (fn [_ e] (print-event prefix e)) nil p))))
 
 (defn- start-process [options]
-  (m/ap (let [p (m/?> (m/observe (fn [!] ((croc options) ! {}))))]
-          (m/amb [:startprocess p] (m/?> (croc-event-flow options p))))))
+  (->> (m/ap (let [p (m/?< (m/observe (fn [!] ((croc options) ! #(prn :err %)))))]
+               (m/amb [:startprocess p] (m/?> (croc-event-flow options p)))))
+       (m/eduction (fn [rf]
+                     (fn
+                       ([] (rf))
+                       ([r] (rf r))
+                       ([r i] (cond-> (rf r i) (= :stopped (first i)) reduced)))))))
 
 (defn start-relay [relay-pass ports]
   (start-process {:global {:pass relay-pass} :relay {:ports ports}}))
@@ -87,19 +103,36 @@
 (defn send-text [relay relay-pass code text]
   (start-process {:global {:relay relay :pass relay-pass} :send {:code code :text text}}))
 
-(defn recv-text [relay relay-pass code]
-  (->> (start-process {:global {:relay relay :pass relay-pass} :recv {:code code}})
-       (m/eduction (fn [rf]
-                     (let [!t (atom [])]
-                       (fn
-                         ([] (rf))
-                         ([r] (rf r))
-                         ([r [evt v :as i]]
-                          (when (= :stdout evt)
-                            (swap! !t conj v))
-                          (if (= evt :stopped)
-                            (reduced (rf r (string/join "\n" @!t)))
-                            (rf r i)))))))))
+(defn recv [relay relay-pass code]
+  (start-process {:global {:relay relay :pass relay-pass} :recv {:code code}}))
+
+(deftest send-text-via-relay-test
+  (let [text "hello\nworld\n!"
+        relay-p (future (r! :relay (start-relay "hello" [9009])))
+        send-p  (future (r! :send (send-text "127.0.0.1:9009" "hello" "kMyr7R4Kzx" text)))
+        recv-task (->> (recv "127.0.0.1:9009" "hello" "kMyr7R4Kzx")
+                       (m/eduction
+                        (fn [rf]
+                          (let [!r (atom [])]
+                            (fn
+                              ([] (rf))
+                              ([r] (rf r))
+                              ([r [e v0 & _ :as i]]
+                               (when (= e :stdout)
+                                 (swap! !r conj v0))
+                               (cond (and (= e :stopped) (zero? (.exitValue (:proc v0))))
+                                     (reduced (rf r [:ok (string/join "\n" @!r)]))
+                                     (= e :stopped)
+                                     (reduced (rf r [:err i]))
+                                     :else
+                                     (rf r i)))))))
+                       (m/reduce (fn [_ [e _r :as i]]
+                                   (if (#{:ok :err} e) i (println i)))
+                                 nil))]
+    (try (Thread/sleep 1000)            ; wait for relay & send process ready
+         (is (= [:ok text] (m/? recv-task)))
+         (finally (future-cancel relay-p)
+                  (future-cancel send-p)))))
 
 (comment
   ;; starting relay
@@ -107,4 +140,4 @@
   ;; sending text via relay
   (def p1 (future (r! :send (send-text "127.0.0.1:9009" "hello" "kMyr7R4Kzx" "hello\nworld\n!!"))))
   ;; recv text via relay
-  (r! :recv (recv-text "127.0.0.1:9009" "hello" "kMyr7R4Kzx")))
+  (r! :recv (recv "127.0.0.1:9009" "hello" "kMyr7R4Kzx")))
